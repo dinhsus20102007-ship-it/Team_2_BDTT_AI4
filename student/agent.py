@@ -25,7 +25,7 @@ class Agent:
         self.cache.clear() # xóa bộ nhớ
 
     @staticmethod
-        def evaluate(board: np.ndarray, merge_score: int) -> float:
+    def evaluate(board: np.ndarray, merge_score: int) -> float:
         """Heuristic nâng cấp: ô trống + ô lớn ở góc + đơn điệu + mượt + cặp ghép được."""
         # Đổi giá trị ô sang log2: 2,4,8,16... -> 1,2,3,4... (ô trống = 0)
         # Làm vậy để chênh lệch 2 ô cạnh nhau không bị phình to theo cấp số nhân
