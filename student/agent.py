@@ -25,53 +25,46 @@ class Agent:
         self.cache.clear() # xóa bộ nhớ
 
     @staticmethod
-    def evaluate(board: np.ndarray, merge_score: int) -> float:
-        """Heuristic nâng cấp: ô trống + ô lớn ở góc + đơn điệu + mượt + cặp ghép được."""
-        # Đổi giá trị ô sang log2: 2,4,8,16... -> 1,2,3,4... (ô trống = 0)
-        # Làm vậy để chênh lệch 2 ô cạnh nhau không bị phình to theo cấp số nhân
-        bang = np.log2(np.maximum(board, 1)).astype(np.float64)
- 
-        # chênh lệch giữa 2 ô liền kề (theo hàng và theo cột)
-        chenh_hang = np.diff(bang, axis=1)
-        chenh_cot = np.diff(bang, axis=0)
- 
-        # cặp ô liền kề mà cả hai đều có số (không tính ô trống)
-        co_so_hang = (board[:, :-1] > 0) & (board[:, 1:] > 0)
-        co_so_cot = (board[:-1, :] > 0) & (board[1:, :] > 0)
- 
-        # 1. Số ô trống: càng nhiều càng tốt (giữ lại ý tưởng của bản gốc)
-        so_o_trong = int(np.count_nonzero(board == 0))
- 
-        # 2. Đơn điệu: mỗi hàng/cột nên chỉ tăng dần HOẶC giảm dần
-        #    tang = tổng các chỗ bị "tụt xuống", giam = tổng các chỗ bị "nhảy lên"
-        #    lấy min vì chỉ cần theo 1 hướng là đủ tốt
-        tang_hang = np.maximum(chenh_hang, 0).sum(axis=1)
-        giam_hang = np.maximum(-chenh_hang, 0).sum(axis=1)
-        tang_cot = np.maximum(chenh_cot, 0).sum(axis=0)
-        giam_cot = np.maximum(-chenh_cot, 0).sum(axis=0)
-        phat_don_dieu = (np.minimum(tang_hang, giam_hang).sum()
-                         + np.minimum(tang_cot, giam_cot).sum())
- 
-        # 3. Độ mượt: 2 ô cạnh nhau càng gần giá trị nhau càng dễ ghép
-        phat_khong_muot = ((np.abs(chenh_hang) * co_so_hang).sum()
-                           + (np.abs(chenh_cot) * co_so_cot).sum())
- 
-        # 4. Số cặp bằng nhau đang đứng cạnh nhau (sắp ghép được)
-        so_cap_ghep = int(((board[:, :-1] == board[:, 1:]) & co_so_hang).sum()
-                          + ((board[:-1, :] == board[1:, :]) & co_so_cot).sum())
- 
-        # 5. Thưởng nếu ô lớn nhất nằm ở 1 trong 4 góc
-        o_lon_nhat = board.max()
-        bon_goc = [board[0, 0], board[0, -1], board[-1, 0], board[-1, -1]]
-        thuong_goc = float(bang.max()) if max(bon_goc) == o_lon_nhat else 0.0
- 
-        return float(250.0 * so_o_trong
-                     + 100.0 * so_cap_ghep
-                     + 60.0 * thuong_goc
-                     - 40.0 * phat_don_dieu
-                     - 15.0 * phat_khong_muot
-                     + merge_score)
-        
+    def evaluate(board: np.ndarray, merge_score: int, _cache={}) -> float:
+        """Heuristic nâng cấp: ô trống + ô lớn ở góc + đơn điệu + mượt + cặp ghép được.
+        Bản tối ưu: tính điểm theo từng hàng/cột và cache lại (kết quả giống hệt bản NumPy)."""
+        hang = board.tolist()                                # int Python thuần, nhanh hơn thao tác trên mảng NumPy nhỏ
+        duong = hang + [list(c) for c in zip(*hang)]         # 4 hàng + 4 cột = 8 đường
+
+        tong = 0.0
+        for duong_i in duong:
+            khoa = tuple(duong_i)
+            diem = _cache.get(khoa)
+            if diem is None:
+                # log2 nhanh cho số nguyên 2^k: 2->1, 4->2, ... ; ô trống = 0
+                bang = [v.bit_length() - 1 if v else 0 for v in khoa]
+                tang = giam = 0
+                phat_muot = 0
+                so_cap = 0
+                for i in range(len(khoa) - 1):
+                    d = bang[i + 1] - bang[i]
+                    if d > 0:
+                        tang += d
+                    else:
+                        giam -= d
+                    if khoa[i] and khoa[i + 1]:              # cả hai ô đều có số
+                        phat_muot += abs(d)
+                        if khoa[i] == khoa[i + 1]:
+                            so_cap += 1
+                # mỗi ô trống nằm trong 1 hàng + 1 cột nên 125 x 2 = 250 như bản gốc
+                diem = (125.0 * khoa.count(0)
+                        + 100.0 * so_cap
+                        - 40.0 * min(tang, giam)
+                        - 15.0 * phat_muot)
+                _cache[khoa] = diem
+            tong += diem
+
+        # thưởng góc: không tách theo hàng được nên tính riêng
+        lon_nhat = max(map(max, hang))
+        if lon_nhat and lon_nhat in (hang[0][0], hang[0][-1], hang[-1][0], hang[-1][-1]):
+            tong += 60.0 * (lon_nhat.bit_length() - 1)
+
+        return float(tong + merge_score)
     
     def expectiminimax(self, board: np.ndarray, depth: int, is_max_turn: bool):
         board_hash = board.tobytes() # ép bảng hiện tại thành 1 chuỗi byte, 2 trạng thái bảng giống nhau chung 1 chuỗi
