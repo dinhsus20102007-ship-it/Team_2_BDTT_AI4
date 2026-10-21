@@ -1,146 +1,176 @@
-"""Điểm bắt đầu của bài nộp — sinh viên chỉ cần sửa file này.
-
-Baseline bên dưới nhìn trước đúng một nước. Nó minh họa API và cách mô phỏng
-nước đi, nhưng cố ý chưa xử lý ô ngẫu nhiên và chưa phải một thuật toán mạnh.
-"""
+"""Agent 2048: expectimax + heuristic tra bảng + iterative deepening theo thời gian."""
 
 from __future__ import annotations
 
-import numpy as np
+import time
 import random
+
+import numpy as np
 
 from game2048.observation import Observation
 from game2048.rules import move_board
 from game2048.types import Move
 
+# ---------------------------------------------------------------- tham số
+LOST_PENALTY = 200000.0   # cộng vào mỗi hàng/cột, thua = 0 nên luôn thấp hơn mọi trạng thái sống
+EMPTY_WEIGHT = 270.0
+MERGE_WEIGHT = 700.0
+MONO_WEIGHT = 47.0
+SUM_WEIGHT = 11.0
+MONO_POWER = 4.0
+SUM_POWER = 3.5
+
+MOVE_BUDGET_MS = 80.0     # thời gian tối đa cho 1 nước, chỉnh theo giới hạn của đề
+MAX_DEPTH = 8
+CHANCE_SAMPLE = 4         # số ô trống được lấy mẫu khi có nhiều hơn 4 ô trống
+
+
+def _build_row_table() -> np.ndarray:
+    """Điểm heuristic cho mọi hàng có thể có (4 ô, mỗi ô là rank 0..15)."""
+    idx = np.arange(65536, dtype=np.int64)
+    r = np.stack([(idx >> (4 * i)) & 15 for i in range(4)], axis=1).astype(np.float64)
+
+    empty = (r == 0).sum(axis=1)
+    # số cặp ô kề nhau bằng nhau (có thể gộp)
+    merges = ((r[:, :-1] == r[:, 1:]) & (r[:, :-1] > 0)).sum(axis=1)
+
+    # đơn điệu: hàng nên tăng hoặc giảm đều, phạt phần ngược chiều nhỏ hơn
+    p = r ** MONO_POWER
+    diff = p[:, :-1] - p[:, 1:]
+    left = np.where(diff > 0, diff, 0.0).sum(axis=1)
+    right = np.where(diff < 0, -diff, 0.0).sum(axis=1)
+    mono = np.minimum(left, right)
+
+    # phạt tổng lũy thừa rank: ép bot gộp ô lớn thay vì để rải rác
+    total = (r ** SUM_POWER).sum(axis=1)
+
+    return (LOST_PENALTY
+            + EMPTY_WEIGHT * empty
+            + MERGE_WEIGHT * merges
+            - MONO_WEIGHT * mono
+            - SUM_WEIGHT * total)
+
+
+ROW_TABLE = _build_row_table()          # chạy 1 lần khi import
+_SHIFTS = np.array([0, 4, 8, 12], dtype=np.int64)
+
+
+class _Timeout(Exception):
+    pass
+
+
 class Agent:
-    # Đổi tên này thành tên đội; nó sẽ xuất hiện trong UI và file kết quả.
-    name = "starter-one-ply"
-    
+    name = "expectimax-table"
+
     def __init__(self):
-        self.cache = {} # dict, khóa là cache_key, gtri là điểm số trạng thái đó
+        self.cache = {}
+        self.deadline = float("inf")
 
     def reset(self, seed: int | None = None) -> None:
-        """Xóa cache/trạng thái giữa hai ván nếu thuật toán của bạn có dùng."""
-        self.cache.clear() # xóa bộ nhớ
+        self.cache.clear()
+        self.deadline = float("inf")
+        if seed is not None:
+            random.seed(seed)
 
     @staticmethod
-    def evaluate(board: np.ndarray, merge_score: int, _cache={}) -> float:
-        """Heuristic nâng cấp: ô trống + ô lớn ở góc + đơn điệu + mượt + cặp ghép được.
-        Bản tối ưu: tính điểm theo từng hàng/cột và cache lại (kết quả giống hệt bản NumPy)."""
-        hang = board.tolist()                                # int Python thuần, nhanh hơn thao tác trên mảng NumPy nhỏ
-        duong = hang + [list(c) for c in zip(*hang)]         # 4 hàng + 4 cột = 8 đường
+    def evaluate(board: np.ndarray, merge_score: int = 0) -> float:
+        # ô -> rank (2->1, 4->2, ...), chặn ở 15 để vừa bảng 65536 hàng
+        e = np.minimum(np.log2(np.maximum(board, 1)).astype(np.int64), 15)
+        rows = (e << _SHIFTS).sum(axis=1)
+        cols = (e.T << _SHIFTS).sum(axis=1)
+        return float(ROW_TABLE[rows].sum() + ROW_TABLE[cols].sum())
 
-        tong = 0.0
-        for duong_i in duong:
-            khoa = tuple(duong_i)
-            diem = _cache.get(khoa)
-            if diem is None:
-                # log2 nhanh cho số nguyên 2^k: 2->1, 4->2, ... ; ô trống = 0
-                bang = [v.bit_length() - 1 if v else 0 for v in khoa]
-                tang = giam = 0
-                phat_muot = 0
-                so_cap = 0
-                for i in range(len(khoa) - 1):
-                    d = bang[i + 1] - bang[i]
-                    if d > 0:
-                        tang += d
-                    else:
-                        giam -= d
-                    if khoa[i] and khoa[i + 1]:              # cả hai ô đều có số
-                        phat_muot += abs(d)
-                        if khoa[i] == khoa[i + 1]:
-                            so_cap += 1
-                # mỗi ô trống nằm trong 1 hàng + 1 cột nên 125 x 2 = 250 như bản gốc
-                diem = (125.0 * khoa.count(0)
-                        + 100.0 * so_cap
-                        - 40.0 * min(tang, giam)
-                        - 15.0 * phat_muot)
-                _cache[khoa] = diem
-            tong += diem
+    def expectiminimax(self, board: np.ndarray, depth: int, is_max_turn: bool) -> float:
+        if time.perf_counter() > self.deadline:
+            raise _Timeout
 
-        # thưởng góc: không tách theo hàng được nên tính riêng
-        lon_nhat = max(map(max, hang))
-        if lon_nhat and lon_nhat in (hang[0][0], hang[0][-1], hang[-1][0], hang[-1][-1]):
-            tong += 60.0 * (lon_nhat.bit_length() - 1)
+        key = (board.tobytes(), depth, is_max_turn)
+        cached = self.cache.get(key)
+        if cached is not None:
+            return cached
 
-        return float(tong + merge_score)
-    
-    def expectiminimax(self, board: np.ndarray, depth: int, is_max_turn: bool):
-        board_hash = board.tobytes() # ép bảng hiện tại thành 1 chuỗi byte, 2 trạng thái bảng giống nhau chung 1 chuỗi
-        cache_key = (board_hash, depth, is_max_turn) # ép các biến tại trạng thái hiện tại vào 1 tuple khóa
-        if cache_key in self.cache:
-            return self.cache[cache_key]
-        if depth == 0: # điều kiện dừng
-            result = self.evaluate(board, 0)
-            self.cache[cache_key] = result
+        if depth == 0:
+            result = self.evaluate(board)
+            self.cache[key] = result
             return result
-        if is_max_turn: # Lượt lấy max
-            max_score = float('-inf')
-            for move in [Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT]:
-                next_board, merge_score, _changed = move_board(board, move)
-                if _changed:
-                    value = merge_score + self.expectiminimax(next_board, depth-1,False)
-                    if value > max_score:
-                        max_score = value
-            if max_score == float('-inf'):
-                result = self.evaluate(board, 0)
-            else:
-                result = max_score
-            self.cache[cache_key] = result
+
+        if is_max_turn:
+            best = float("-inf")
+            for move in (Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT):
+                nb, ms, changed = move_board(board, move)
+                if changed:
+                    v = ms + self.expectiminimax(nb, depth - 1, False)
+                    if v > best:
+                        best = v
+            result = 0.0 if best == float("-inf") else best   # hết nước đi = thua
+            self.cache[key] = result
             return result
-        else: # Lượt sinh ô mới
-            empty_rows, empty_cols = np.where(board==0)
-            empty = len(empty_rows)
-            if empty == 0:
-                result = self.evaluate(board, 0)
-                self.cache[cache_key] = result
-                return result
-            toa_do_trong = list(zip(empty_rows,empty_cols))
-    # Cắt tỉa nhánh, nếu nhiều hơn 4 ô trống, lấy bừa 1 ô để mô phỏng, nhiều hơn 4 ô thì min(empty,2)
-            SAMPLE = 1 if empty > 4 else min(empty, 2) 
-            if empty > SAMPLE:
-                toa_do_bat_ky = random.sample(toa_do_trong,SAMPLE)
-                ty_le = 1/SAMPLE # xác suất rơi vào ô này
-            else: 
-                toa_do_bat_ky = toa_do_trong
-                ty_le = 1/empty
-            expected_value = 0
-            for r,c in toa_do_bat_ky:
-                board[r,c] = 2
-                expected_value += (ty_le*0.9)*self.expectiminimax(board,depth,True) # xác suất là ô 2
-                board[r,c] = 4
-                expected_value += (ty_le*0.1)*self.expectiminimax(board,depth,True) # xác suất là ô 4
-                board[r,c] = 0
-            self.cache[cache_key] = expected_value
-            return expected_value
- 
+
+        # lượt sinh ô mới
+        rows, cols = np.where(board == 0)
+        empty = len(rows)
+        if empty == 0:
+            result = self.evaluate(board)
+            self.cache[key] = result
+            return result
+
+        cells = list(zip(rows.tolist(), cols.tolist()))
+        if empty > 4:
+            cells = random.sample(cells, min(CHANCE_SAMPLE, empty))
+        prob = 1.0 / len(cells)
+
+        expected = 0.0
+        for r, c in cells:
+            try:
+                board[r, c] = 2
+                v2 = self.expectiminimax(board, depth, True)
+                board[r, c] = 4
+                v4 = self.expectiminimax(board, depth, True)
+            finally:
+                board[r, c] = 0      # luôn trả board về nguyên trạng, kể cả khi timeout
+            expected += prob * (0.9 * v2 + 0.1 * v4)
+
+        self.cache[key] = expected
+        return expected
+
     def choose_move(self, obs: Observation, time_limit_ms: float) -> Move:
-        """Trả về đúng một phần tử ``Move`` có trong ``obs.legal_moves``.
-
-        Khi chấm theo tổng thời gian, ``time_limit_ms`` và
-        ``obs.time_remaining_ms`` là ngân sách còn lại của cả ván — không phải
-        lời hứa rằng mỗi nước được phép dùng hết số đó.
-        """
         if not obs.legal_moves:
             raise ValueError("choose_move được gọi ở trạng thái kết thúc")
-        if obs.time_remaining_ms is not None and obs.time_remaining_ms < 500:#tgian có hạn và chỉ còn 500ms
-            return obs.legal_moves[0] # đi bừa 1 bước hợp lệ
+        if len(obs.legal_moves) == 1:
+            return obs.legal_moves[0]
+        if obs.time_remaining_ms is not None and obs.time_remaining_ms < 500:
+            return obs.legal_moves[0]
 
+        # ngân sách cho nước này
+        budget = min(MOVE_BUDGET_MS, 0.6 * time_limit_ms)
+        if obs.time_remaining_ms is not None:
+            budget = min(budget, obs.time_remaining_ms / 150.0)
+        budget = max(budget, 5.0)
+
+        t0 = time.perf_counter()
+        self.cache.clear()
+        self.deadline = float("inf")          # depth 1 luôn chạy xong
         best_move = obs.legal_moves[0]
-        best_value = float("-inf")
-        empty_count = obs.board.flatten().tolist().count(0) #mảng 2D ép thành 1D, chuyển về list, đếm số 0
-        if empty_count <= 1:
-            search_depth = 4
-        elif empty_count <= 3:
-            search_depth = 3
-        else:
-            search_depth = 2
-        for move in obs.legal_moves:
-            next_board, merge_score, _changed = move_board(obs.board, move)
-            if _changed: 
-                value = merge_score + self.expectiminimax(next_board, search_depth, False)
-            if value > best_value:
-                best_value = value
-                best_move = move
+
+        for depth in range(1, MAX_DEPTH + 1):
+            cur_move, cur_val = None, float("-inf")
+            try:
+                for move in obs.legal_moves:
+                    nb, ms, changed = move_board(obs.board, move)
+                    if not changed:
+                        continue
+                    v = ms + self.expectiminimax(nb, depth, False)
+                    if v > cur_val:
+                        cur_val, cur_move = v, move
+            except _Timeout:
+                break                          # bỏ kết quả dở dang của tầng này
+            if cur_move is not None:
+                best_move = cur_move
+
+            elapsed = (time.perf_counter() - t0) * 1000.0
+            if elapsed > budget * 0.35:        # tầng sau tốn gấp vài lần, không đủ thì dừng
+                break
+            self.deadline = t0 + budget / 1000.0
+
+        self.deadline = float("inf")
         return best_move
