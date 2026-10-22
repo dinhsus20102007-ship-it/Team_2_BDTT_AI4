@@ -1,18 +1,14 @@
-"""Agent 2048: expectimax + heuristic tra bảng + iterative deepening theo thời gian."""
+"""Agent 2048: bitboard + bảng tra + expectimax, iterative deepening theo ngân sách compute."""
 
 from __future__ import annotations
 
 import time
-import random
-
-import numpy as np
 
 from game2048.observation import Observation
-from game2048.rules import move_board
 from game2048.types import Move
 
-# ---------------------------------------------------------------- tham số
-LOST_PENALTY = 200000.0   # cộng vào mỗi hàng/cột, thua = 0 nên luôn thấp hơn mọi trạng thái sống
+# ------------------------------------------------------------ heuristic (theo từng hàng)
+LOST_PENALTY = 200000.0
 EMPTY_WEIGHT = 270.0
 MERGE_WEIGHT = 700.0
 MONO_WEIGHT = 47.0
@@ -20,39 +16,126 @@ SUM_WEIGHT = 11.0
 MONO_POWER = 4.0
 SUM_POWER = 3.5
 
-MOVE_BUDGET_MS = 80.0     # thời gian tối đa cho 1 nước, chỉnh theo giới hạn của đề
-MAX_DEPTH = 8
-CHANCE_SAMPLE = 4         # số ô trống được lấy mẫu khi có nhiều hơn 4 ô trống
+# ------------------------------------------------------------ search
+MAX_DEPTH = 12
+PROB_CUT = 0.0001          # cắt nhánh có xác suất tích lũy quá nhỏ
+# chia ngân sách còn lại của cả ván cho hệ số này để ra ngân sách 1 nước
+DIV_SAFE = 1500.0          # >= 7 ô trống: đi nhanh
+DIV_MID = 600.0            # 4..6 ô trống
+DIV_DANGER = 250.0         # <= 3 ô trống: nghĩ sâu
+MIN_BUDGET_MS = 3.0
 
 
-def _build_row_table() -> np.ndarray:
-    """Điểm heuristic cho mọi hàng có thể có (4 ô, mỗi ô là rank 0..15)."""
-    idx = np.arange(65536, dtype=np.int64)
-    r = np.stack([(idx >> (4 * i)) & 15 for i in range(4)], axis=1).astype(np.float64)
-
-    empty = (r == 0).sum(axis=1)
-    # số cặp ô kề nhau bằng nhau (có thể gộp)
-    merges = ((r[:, :-1] == r[:, 1:]) & (r[:, :-1] > 0)).sum(axis=1)
-
-    # đơn điệu: hàng nên tăng hoặc giảm đều, phạt phần ngược chiều nhỏ hơn
-    p = r ** MONO_POWER
-    diff = p[:, :-1] - p[:, 1:]
-    left = np.where(diff > 0, diff, 0.0).sum(axis=1)
-    right = np.where(diff < 0, -diff, 0.0).sum(axis=1)
-    mono = np.minimum(left, right)
-
-    # phạt tổng lũy thừa rank: ép bot gộp ô lớn thay vì để rải rác
-    total = (r ** SUM_POWER).sum(axis=1)
-
-    return (LOST_PENALTY
-            + EMPTY_WEIGHT * empty
-            + MERGE_WEIGHT * merges
-            - MONO_WEIGHT * mono
-            - SUM_WEIGHT * total)
+def _pack(cells):
+    return cells[0] | (cells[1] << 4) | (cells[2] << 8) | (cells[3] << 12)
 
 
-ROW_TABLE = _build_row_table()          # chạy 1 lần khi import
-_SHIFTS = np.array([0, 4, 8, 12], dtype=np.int64)
+def _slide_left(line):
+    tiles = [x for x in line if x]
+    out = []
+    i = 0
+    while i < len(tiles):
+        if i + 1 < len(tiles) and tiles[i] == tiles[i + 1]:
+            out.append(min(tiles[i] + 1, 15))
+            i += 2
+        else:
+            out.append(tiles[i])
+            i += 1
+    out += [0] * (4 - len(out))
+    return out
+
+
+def _build_tables():
+    left = [0] * 65536
+    right = [0] * 65536
+    heur = [0.0] * 65536
+    for row in range(65536):
+        line = [(row >> (4 * i)) & 0xF for i in range(4)]
+
+        left[row] = _pack(_slide_left(line))
+        right[row] = _pack(_slide_left(line[::-1])[::-1])
+
+        total = 0.0
+        empty = 0
+        merges = 0
+        prev = 0
+        counter = 0
+        for rank in line:
+            total += rank ** SUM_POWER
+            if rank == 0:
+                empty += 1
+            else:
+                if prev == rank:
+                    counter += 1
+                elif counter > 0:
+                    merges += 1 + counter
+                    counter = 0
+                prev = rank
+        if counter > 0:
+            merges += 1 + counter
+
+        mono_l = mono_r = 0.0
+        for i in range(1, 4):
+            if line[i - 1] > line[i]:
+                mono_l += line[i - 1] ** MONO_POWER - line[i] ** MONO_POWER
+            else:
+                mono_r += line[i] ** MONO_POWER - line[i - 1] ** MONO_POWER
+
+        heur[row] = (LOST_PENALTY
+                     + EMPTY_WEIGHT * empty
+                     + MERGE_WEIGHT * merges
+                     - MONO_WEIGHT * min(mono_l, mono_r)
+                     - SUM_WEIGHT * total)
+    return left, right, heur
+
+
+_LEFT, _RIGHT, _HEUR = _build_tables()     # chạy 1 lần khi import
+_ORDER = (Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT)
+
+
+def _transpose(x: int) -> int:
+    a1 = x & 0xF0F00F0FF0F00F0F
+    a2 = x & 0x0000F0F00000F0F0
+    a3 = x & 0x0F0F00000F0F0000
+    a = a1 | (a2 << 12) | (a3 >> 12)
+    b1 = a & 0xFF00FF0000FF00FF
+    b2 = a & 0x00FF00FF00000000
+    b3 = a & 0x00000000FF00FF00
+    return b1 | (b2 >> 24) | (b3 << 24)
+
+
+def _shift(b: int, table) -> int:
+    return (table[b & 0xFFFF]
+            | (table[(b >> 16) & 0xFFFF] << 16)
+            | (table[(b >> 32) & 0xFFFF] << 32)
+            | (table[(b >> 48) & 0xFFFF] << 48))
+
+
+def _apply(b: int, i: int) -> int:
+    """i: 0=UP, 1=DOWN, 2=LEFT, 3=RIGHT. Trả về bảng mới (bằng b nếu không đổi)."""
+    if i == 2:
+        return _shift(b, _LEFT)
+    if i == 3:
+        return _shift(b, _RIGHT)
+    t = _transpose(b)
+    t = _shift(t, _LEFT if i == 0 else _RIGHT)
+    return _transpose(t)
+
+
+def _eval(b: int) -> float:
+    t = _transpose(b)
+    return (_HEUR[b & 0xFFFF] + _HEUR[(b >> 16) & 0xFFFF]
+            + _HEUR[(b >> 32) & 0xFFFF] + _HEUR[b >> 48]
+            + _HEUR[t & 0xFFFF] + _HEUR[(t >> 16) & 0xFFFF]
+            + _HEUR[(t >> 32) & 0xFFFF] + _HEUR[t >> 48])
+
+
+def _to_bits(board) -> int:
+    b = 0
+    for i, v in enumerate(board.flatten().tolist()):
+        if v:
+            b |= min(int(v).bit_length() - 1, 15) << (4 * i)
+    return b
 
 
 class _Timeout(Exception):
@@ -60,7 +143,7 @@ class _Timeout(Exception):
 
 
 class Agent:
-    name = "expectimax-table"
+    name = "bitboard-expectimax"
 
     def __init__(self):
         self.cache = {}
@@ -69,106 +152,78 @@ class Agent:
     def reset(self, seed: int | None = None) -> None:
         self.cache.clear()
         self.deadline = float("inf")
-        if seed is not None:
-            random.seed(seed)
 
-    @staticmethod
-    def evaluate(board: np.ndarray, merge_score: int = 0) -> float:
-        # ô -> rank (2->1, 4->2, ...), chặn ở 15 để vừa bảng 65536 hàng
-        e = np.minimum(np.log2(np.maximum(board, 1)).astype(np.int64), 15)
-        rows = (e << _SHIFTS).sum(axis=1)
-        cols = (e.T << _SHIFTS).sum(axis=1)
-        return float(ROW_TABLE[rows].sum() + ROW_TABLE[cols].sum())
-
-    def expectiminimax(self, board: np.ndarray, depth: int, is_max_turn: bool) -> float:
+    # ---- nút người chơi
+    def _max(self, b: int, depth: int, cprob: float) -> float:
+        if depth == 0:
+            return _eval(b)
         if time.perf_counter() > self.deadline:
             raise _Timeout
+        key = (b, depth)
+        hit = self.cache.get(key)
+        if hit is not None:
+            return hit
+        best = 0.0                                  # hết nước đi = thua = 0
+        for i in range(4):
+            nb = _apply(b, i)
+            if nb != b:
+                v = self._chance(nb, depth - 1, cprob)
+                if v > best:
+                    best = v
+        self.cache[key] = best
+        return best
 
-        key = (board.tobytes(), depth, is_max_turn)
-        cached = self.cache.get(key)
-        if cached is not None:
-            return cached
-
-        if depth == 0:
-            result = self.evaluate(board)
-            self.cache[key] = result
-            return result
-
-        if is_max_turn:
-            best = float("-inf")
-            for move in (Move.UP, Move.DOWN, Move.LEFT, Move.RIGHT):
-                nb, ms, changed = move_board(board, move)
-                if changed:
-                    v = ms + self.expectiminimax(nb, depth - 1, False)
-                    if v > best:
-                        best = v
-            result = 0.0 if best == float("-inf") else best   # hết nước đi = thua
-            self.cache[key] = result
-            return result
-
-        # lượt sinh ô mới
-        rows, cols = np.where(board == 0)
-        empty = len(rows)
-        if empty == 0:
-            result = self.evaluate(board)
-            self.cache[key] = result
-            return result
-
-        cells = list(zip(rows.tolist(), cols.tolist()))
-        if empty > 4:
-            cells = random.sample(cells, min(CHANCE_SAMPLE, empty))
-        prob = 1.0 / len(cells)
-
-        expected = 0.0
-        for r, c in cells:
-            try:
-                board[r, c] = 2
-                v2 = self.expectiminimax(board, depth, True)
-                board[r, c] = 4
-                v4 = self.expectiminimax(board, depth, True)
-            finally:
-                board[r, c] = 0      # luôn trả board về nguyên trạng, kể cả khi timeout
-            expected += prob * (0.9 * v2 + 0.1 * v4)
-
-        self.cache[key] = expected
-        return expected
+    # ---- nút sinh ô mới
+    def _chance(self, b: int, depth: int, cprob: float) -> float:
+        if cprob < PROB_CUT:
+            return _eval(b)
+        empties = [s for s in range(0, 64, 4) if not (b >> s) & 0xF]
+        n = len(empties)
+        c2 = cprob * 0.9 / n
+        c4 = cprob * 0.1 / n
+        total = 0.0
+        for s in empties:
+            total += 0.9 * self._max(b | (1 << s), depth, c2)
+            total += 0.1 * self._max(b | (2 << s), depth, c4)
+        return total / n
 
     def choose_move(self, obs: Observation, time_limit_ms: float) -> Move:
-        if not obs.legal_moves:
+        legal = obs.legal_moves
+        if not legal:
             raise ValueError("choose_move được gọi ở trạng thái kết thúc")
-        if len(obs.legal_moves) == 1:
-            return obs.legal_moves[0]
-        if obs.time_remaining_ms is not None and obs.time_remaining_ms < 500:
-            return obs.legal_moves[0]
+        if len(legal) == 1:
+            return legal[0]
 
-        # ngân sách cho nước này
-        budget = min(MOVE_BUDGET_MS, 0.6 * time_limit_ms)
-        if obs.time_remaining_ms is not None:
-            budget = min(budget, obs.time_remaining_ms / 150.0)
-        budget = max(budget, 5.0)
+        b = _to_bits(obs.board)
+        empty = sum(1 for s in range(0, 64, 4) if not (b >> s) & 0xF)
+
+        total = obs.time_remaining_ms if obs.time_remaining_ms is not None else time_limit_ms
+        div = DIV_SAFE if empty >= 7 else (DIV_MID if empty >= 4 else DIV_DANGER)
+        budget = max(total / div, MIN_BUDGET_MS)
+
+        cands = [(i, _ORDER[i]) for i in range(4) if _ORDER[i] in legal]
+        best_move = legal[0]
 
         t0 = time.perf_counter()
         self.cache.clear()
-        self.deadline = float("inf")          # depth 1 luôn chạy xong
-        best_move = obs.legal_moves[0]
+        self.deadline = float("inf")                # depth 1 luôn chạy xong
 
         for depth in range(1, MAX_DEPTH + 1):
-            cur_move, cur_val = None, float("-inf")
+            cur_move, cur_val = None, -1.0
             try:
-                for move in obs.legal_moves:
-                    nb, ms, changed = move_board(obs.board, move)
-                    if not changed:
+                for i, mv in cands:
+                    nb = _apply(b, i)
+                    if nb == b:
                         continue
-                    v = ms + self.expectiminimax(nb, depth, False)
+                    v = self._chance(nb, depth - 1, 1.0)
                     if v > cur_val:
-                        cur_val, cur_move = v, move
+                        cur_val, cur_move = v, mv
             except _Timeout:
-                break                          # bỏ kết quả dở dang của tầng này
+                break                               # bỏ kết quả dở dang của tầng này
             if cur_move is not None:
                 best_move = cur_move
-
             elapsed = (time.perf_counter() - t0) * 1000.0
-            if elapsed > budget * 0.35:        # tầng sau tốn gấp vài lần, không đủ thì dừng
+            if elapsed > budget * 0.3:              # tầng sau tốn gấp vài lần, không đủ thì dừng
                 break
             self.deadline = t0 + budget / 1000.0
 
